@@ -1934,13 +1934,13 @@ def ocr_studio_tab():
                         system_prompt=system_prompt,
                         provider=provider,
                     )
-                    try:
-                        with st.spinner("Calling LLM to clean & restructure OCR text…"):
-                            llm_out = run_agent(dummy_agent, raw_text)
-                            st.session_state.ocr_llm_text = llm_out or ""
-                    except Exception as e:
-                        st.error(f"LLM OCR error: {e}")
-                        st.session_state.ocr_llm_text = ""
+ #                   try:
+ #                       with st.spinner("Calling LLM to clean & restructure OCR text"):
+ #                           llm_out = run_agent(dummy_agent, raw_text)
+ #                           st.session_state.ocr_llm_text = llm_out or ""
+ #                   except Exception as e:
+ #                       st.error(f"LLM OCR error: {e}")
+ #                       st.session_state.ocr_llm_text = ""
 
         if st.session_state.ocr_raw_text:
             st.markdown("**Raw OCR Text (EasyOCR)**")
