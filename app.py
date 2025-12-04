@@ -1934,13 +1934,13 @@ def ocr_studio_tab():
                         system_prompt=system_prompt,
                         provider=provider,
                     )
- #                   try:
- #                       with st.spinner("Calling LLM to clean & restructure OCR text"):
- #                           llm_out = run_agent(dummy_agent, raw_text)
- #                           st.session_state.ocr_llm_text = llm_out or ""
- #                   except Exception as e:
- #                       st.error(f"LLM OCR error: {e}")
- #                       st.session_state.ocr_llm_text = ""
+                    try:
+                        with st.spinner("Calling LLM to clean & restructure OCR text"):
+                            llm_out = run_agent(dummy_agent, raw_text)
+                            st.session_state.ocr_llm_text = llm_out or ""
+                    except Exception as e:
+                        st.error(f"LLM OCR error: {e}")
+                        st.session_state.ocr_llm_text = ""
 
         if st.session_state.ocr_raw_text:
             st.markdown("**Raw OCR Text (EasyOCR)**")
@@ -1972,15 +1972,6 @@ def ocr_studio_tab():
 # =========================
 # 11. DASHBOARD TAB
 # =========================
-
-def dashboard_tab():
-    st.subheader("📊 Interactive Analytics Dashboard")
-
-    m = st.session_state.metrics
-    top_cols = st.columns(4)
-    top_cols[0].metric("Total Agent Runs", m["total_runs"])
-    top_cols[1].metric("Tokens (approx.) Used", m["tokens_used"])
-    top_cols[2].metric("Last Run Duration (s)", round(m["last_run_duration
 
 # =========================
 # 10. DASHBOARD TAB
