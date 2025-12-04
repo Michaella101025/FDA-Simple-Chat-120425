@@ -1,12 +1,18 @@
 import os
 import time
 import random
+import io
+import base64
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
 import streamlit as st
+import streamlit.components.v1 as components
 import yaml
 import pandas as pd
+
+# PDF tools
+from PyPDF2 import PdfReader, PdfWriter
 
 # --- AI SDKs ---
 import google.generativeai as genai
@@ -58,7 +64,7 @@ THEME_MODE_LABELS = {
     "dark": "Dark",
 }
 
-# 20 flower-based Nordic themes
+# 20 flower-based themes
 FLOWER_THEMES = [
     {
         "id": "nordic_lotus",
@@ -268,7 +274,7 @@ class AppState:
 
 
 # =========================
-# 2. SESSION INIT
+# 2. SESSION INIT / AGENTS
 # =========================
 
 def load_agents_yaml(path: str) -> List[AgentConfig]:
@@ -319,14 +325,25 @@ def init_session_state():
             "provider_calls": {"gemini": 0, "openai": 0, "anthropic": 0, "xai": 0},
             "tokens_used": 0,
             "last_run_duration": 0.0,
-            "run_history": [],  # list of dicts: {time, provider, duration, agent_id}
+            "run_history": [],
         }
     if "agent_status" not in st.session_state:
-        # idle / running / success / error
         st.session_state.agent_status = {}
-    # Ensure every loaded agent has status
     for a in st.session_state.agents:
         st.session_state.agent_status.setdefault(a.id, "idle")
+
+    # PDF workspace state
+    st.session_state.setdefault("pdf_a_bytes", None)
+    st.session_state.setdefault("pdf_b_bytes", None)
+    st.session_state.setdefault("pdf_combined_bytes", None)
+    st.session_state.setdefault("pdf_combined_text", "")
+    st.session_state.setdefault("pdf_summary_md", "")
+    st.session_state.setdefault("pdf_word_graph_md", "")
+    st.session_state.setdefault("pdf_compare_result_a", "")
+    st.session_state.setdefault("pdf_compare_result_b", "")
+    st.session_state.setdefault("pdf_compare_view_a", "Preview (Markdown)")
+    st.session_state.setdefault("pdf_compare_view_b", "Preview (Markdown)")
+    st.session_state.setdefault("pdf_colored_note", "")
 
 
 # =========================
@@ -366,10 +383,6 @@ def inject_global_css():
         padding-top: 1.0rem;
     }}
 
-    h1, h2, h3, h4 {{
-        letter-spacing: 0.02em;
-    }}
-
     .nordic-card {{
         background: rgba(7, 10, 20, {surface_alpha});
         border-radius: 18px;
@@ -395,7 +408,6 @@ def inject_global_css():
         color: {text_color};
     }}
 
-    /* Buttons */
     div.stButton > button:first-child {{
         border-radius: 999px;
         border: 1px solid rgba(255,255,255,0.35);
@@ -410,7 +422,6 @@ def inject_global_css():
         filter: brightness(1.03);
     }}
 
-    /* Tabs */
     .stTabs [data-baseweb="tab-list"] {{
         gap: 0.5rem;
         border-bottom: 1px solid rgba(255,255,255,0.12);
@@ -422,7 +433,6 @@ def inject_global_css():
         background-color: rgba(255,255,255,0.02);
     }}
 
-    /* WOW status indicators */
     .status-dot {{
         height: 10px;
         width: 10px;
@@ -514,7 +524,6 @@ def env_api_key_present(provider: str) -> bool:
 
 
 def get_api_key(provider: str) -> Optional[str]:
-    # Prefer environment (do not show), fallback to session/UI field
     key_env = None
     if provider == "gemini":
         key_env = os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY")
@@ -546,7 +555,6 @@ def api_key_input_ui():
         with col:
             env_present = env_api_key_present(provider)
             if env_present:
-                # silently ensure env key is cached
                 _ = get_api_key(provider)
                 st.success(f"{label}：using environment key")
             else:
@@ -665,7 +673,6 @@ def run_agent(agent: AgentConfig, input_text: str) -> str:
     model = agent.model
     t0 = time.time()
 
-    # Mark status as running
     st.session_state.agent_status[agent.id] = "running"
 
     if provider == "gemini":
@@ -682,7 +689,6 @@ def run_agent(agent: AgentConfig, input_text: str) -> str:
 
     duration = time.time() - t0
 
-    # Update metrics
     st.session_state.metrics["provider_calls"][provider] += 1
     st.session_state.metrics["total_runs"] += 1
     st.session_state.metrics["last_run_duration"] = duration
@@ -694,10 +700,8 @@ def run_agent(agent: AgentConfig, input_text: str) -> str:
             "agent_id": agent.id,
         }
     )
-    # Naive token estimate (upper bound)
     st.session_state.metrics["tokens_used"] += agent.max_tokens
 
-    # Gamification: mana, xp, level
     st.session_state.app_state.mana = max(0, st.session_state.app_state.mana - 20)
     st.session_state.app_state.experience += 10
     st.session_state.app_state.level = 1 + st.session_state.app_state.experience // 100
@@ -771,7 +775,6 @@ def wow_status_bar():
         st.progress(stress / 100, text=f"Stress: {stress}%")
         st.markdown("</div></div>", unsafe_allow_html=True)
 
-    # Achievement Blossoms
     unlocked = []
     if app.experience >= 50:
         unlocked.append("🌸 First Bloom (50+ XP)")
@@ -796,10 +799,6 @@ def lucky_flower_jackpot():
         st.toast(f"Theme changed to {theme['name_en']} / {theme['name_zh']}")
 
 
-# =========================
-# 7. PIPELINE UI
-# =========================
-
 def render_agent_status_badge(agent_id: str):
     status = st.session_state.agent_status.get(agent_id, "idle")
     label_map = {
@@ -815,6 +814,10 @@ def render_agent_status_badge(agent_id: str):
         unsafe_allow_html=True,
     )
 
+
+# =========================
+# 7. PIPELINE TAB
+# =========================
 
 def pipeline_tab():
     st.subheader("🔗 Multi-Agent 510(k) Review Pipeline")
@@ -853,9 +856,6 @@ def pipeline_tab():
     with toolbar_cols[2]:
         st.caption("Max tokens default = 12,000 · Models: Gemini / OpenAI / Anthropic / Grok")
 
-    # ==============================
-    # FULL PIPELINE EXECUTION
-    # ==============================
     if run_all:
         if st.session_state.app_state.mana < 20:
             st.error("Not enough Mana to start the pipeline (need at least 20).")
@@ -887,7 +887,6 @@ def pipeline_tab():
             if sys_key in st.session_state:
                 a.system_prompt = st.session_state[sys_key]
 
-            # Determine input for this agent in full pipeline mode:
             if idx == 0:
                 step_input = global_input or ""
             else:
@@ -925,10 +924,6 @@ def pipeline_tab():
                     st.error(f"Agent {a.name} failed: {e}")
                     break
 
-    # ==============================
-    # PER-AGENT CONFIG + STEP RUN
-    # ==============================
-
     st.markdown("### 📄 Per-Agent Configuration & Editable Chain")
 
     prev_agent_id = None
@@ -936,7 +931,6 @@ def pipeline_tab():
         with st.container():
             st.markdown("<div class='nordic-card'>", unsafe_allow_html=True)
 
-            # Header row with status + tags
             header_cols = st.columns([4, 2])
             with header_cols[0]:
                 st.markdown(
@@ -964,7 +958,6 @@ def pipeline_tab():
 
             st.markdown("---")
 
-            # --- Agent config controls ---
             cfg_expander = st.expander("⚙️ Model & Prompt (Advanced)", expanded=False)
             with cfg_expander:
                 cfg_cols = st.columns([1, 1, 1, 1])
@@ -1012,7 +1005,6 @@ def pipeline_tab():
                     height=160,
                 )
 
-            # --- Input to this agent (editable) ---
             st.markdown("**Input to this agent**")
             input_key = f"input_{a.id}"
 
@@ -1036,7 +1028,6 @@ def pipeline_tab():
                 key=input_key,
             )
 
-            # --- Run this step only ---
             run_step = st.button(f"▶️ Run only this step: {a.name}", key=f"run_step_{a.id}")
 
             if run_step:
@@ -1066,7 +1057,6 @@ def pipeline_tab():
                             )
                             st.error(f"Agent {a.name} failed: {e}")
 
-            # --- Output of this agent: Text edit vs Markdown preview ---
             if a.id in st.session_state.pipeline_results:
                 st.markdown("**Output of this agent**")
 
@@ -1255,7 +1245,508 @@ Use Markdown:
 
 
 # =========================
-# 9. DASHBOARD TAB
+# 9. PDF STUDIO (NEW FEATURE)
+# =========================
+
+def pdf_to_base64(pdf_bytes: bytes) -> str:
+    return base64.b64encode(pdf_bytes).decode("utf-8")
+
+
+def pdf_viewer(pdf_bytes: bytes, height: int = 700, key: str = ""):
+    if not pdf_bytes:
+        return
+    b64 = pdf_to_base64(pdf_bytes)
+    html = f"""
+    <iframe
+        src="data:application/pdf;base64,{b64}"
+        width="100%"
+        height="{height}px"
+        type="application/pdf">
+    </iframe>
+    """
+    components.html(html, height=height + 10, scrolling=False)
+
+
+def merge_pdfs_bytes(pdf1_bytes: bytes, pdf2_bytes: bytes) -> bytes:
+    writer = PdfWriter()
+    for b in (pdf1_bytes, pdf2_bytes):
+        reader = PdfReader(io.BytesIO(b))
+        for page in reader.pages:
+            writer.add_page(page)
+    out_buf = io.BytesIO()
+    writer.write(out_buf)
+    return out_buf.getvalue()
+
+
+def extract_pdf_text_from_bytes(pdf_bytes: bytes) -> str:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    texts = []
+    for page in reader.pages:
+        try:
+            texts.append(page.extract_text() or "")
+        except Exception:
+            continue
+    return "\n\n".join(texts)
+
+
+def highlight_keywords_colored(text: str, keyword_str: str, color_hex: str) -> str:
+    if not keyword_str.strip():
+        return text
+    if not color_hex.startswith("#"):
+        color_hex = "#" + color_hex
+    bg = color_hex + "33" if len(color_hex) == 7 else color_hex
+    keywords = [k.strip() for k in keyword_str.split(",") if k.strip()]
+    escaped = text
+    for kw in keywords:
+        escaped = escaped.replace(
+            kw,
+            f"<span style='background-color:{bg};color:{color_hex};font-weight:bold;'>{kw}</span>",
+        )
+    return escaped
+
+
+def pdf_studio_tab():
+    st.subheader("📎 PDF Studio · Merge, Summarize & Compare")
+
+    # --- Upload two PDFs ---
+    col_a, col_b = st.columns(2)
+    with col_a:
+        pdf_a = st.file_uploader("Upload PDF A", type="pdf", key="pdf_a_uploader")
+        if pdf_a is not None:
+            st.session_state.pdf_a_bytes = pdf_a.getvalue()
+    with col_b:
+        pdf_b = st.file_uploader("Upload PDF B", type="pdf", key="pdf_b_uploader")
+        if pdf_b is not None:
+            st.session_state.pdf_b_bytes = pdf_b.getvalue()
+
+    pdf_a_bytes = st.session_state.pdf_a_bytes
+    pdf_b_bytes = st.session_state.pdf_b_bytes
+
+    # --- Individual previews with zoom ---
+    if pdf_a_bytes or pdf_b_bytes:
+        st.markdown("### 🔍 Preview Individual PDFs")
+        prev_col1, prev_col2 = st.columns(2)
+        with prev_col1:
+            st.markdown("**PDF A Preview**")
+            if pdf_a_bytes:
+                zoom_a = st.slider("Zoom (height px) - A", 400, 1200, 700, key="pdf_a_zoom")
+                pdf_viewer(pdf_a_bytes, height=zoom_a, key="viewer_a")
+            else:
+                st.info("Upload PDF A to preview.")
+        with prev_col2:
+            st.markdown("**PDF B Preview**")
+            if pdf_b_bytes:
+                zoom_b = st.slider("Zoom (height px) - B", 400, 1200, 700, key="pdf_b_zoom")
+                pdf_viewer(pdf_b_bytes, height=zoom_b, key="viewer_b")
+            else:
+                st.info("Upload PDF B to preview.")
+
+    st.markdown("---")
+
+    # --- Combine PDFs ---
+    combine_disabled = not (pdf_a_bytes and pdf_b_bytes)
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        combine_clicked = st.button("🧩 Combine Two PDFs into One", disabled=combine_disabled)
+    with c2:
+        if combine_disabled:
+            st.caption("請先上傳兩個 PDF 檔案，才能進行合併。")
+
+    if combine_clicked and pdf_a_bytes and pdf_b_bytes:
+        try:
+            combined = merge_pdfs_bytes(pdf_a_bytes, pdf_b_bytes)
+            st.session_state.pdf_combined_bytes = combined
+            st.session_state.pdf_combined_text = extract_pdf_text_from_bytes(combined)
+            st.success("Combined PDF generated and text extracted successfully.")
+        except Exception as e:
+            st.error(f"Failed to combine PDFs: {e}")
+
+    combined_bytes = st.session_state.pdf_combined_bytes
+    combined_text = st.session_state.pdf_combined_text
+
+    # --- Combined preview and download ---
+    if combined_bytes:
+        st.markdown("### 📄 Combined PDF Preview & Download")
+        cp1, cp2 = st.columns([2, 1])
+        with cp1:
+            zoom_c = st.slider("Zoom (height px) - Combined", 400, 1400, 800, key="pdf_c_zoom")
+            pdf_viewer(combined_bytes, height=zoom_c, key="viewer_combined")
+        with cp2:
+            st.download_button(
+                "💾 Download Combined PDF",
+                data=combined_bytes,
+                file_name="combined.pdf",
+                mime="application/pdf",
+            )
+            st.caption("下載已合併的 PDF 檔案，作為存檔或後續審查資料。")
+
+    # --- Summary of combined file ---
+    if combined_text:
+        st.markdown("### 🧠 Comprehensive Summary of Combined PDF")
+
+        col_cfg, col_sum = st.columns([0.9, 1.1])
+        with col_cfg:
+            provider = st.selectbox(
+                "Provider for Summary",
+                options=list(AI_MODELS.keys()),
+                index=0,
+                key="pdf_summary_provider",
+            )
+            model = st.selectbox(
+                "Model for Summary",
+                options=AI_MODELS[provider],
+                key="pdf_summary_model",
+            )
+            temperature = st.slider(
+                "Temperature",
+                0.0,
+                1.0,
+                value=0.3,
+                key="pdf_summary_temp",
+            )
+            max_tokens = st.number_input(
+                "Max Tokens",
+                min_value=256,
+                max_value=DEFAULT_MAX_TOKENS,
+                value=DEFAULT_MAX_TOKENS,
+                step=256,
+                key="pdf_summary_max_tokens",
+            )
+            summary_prompt = st.text_area(
+                "Summary Prompt (Markdown Output)",
+                value=st.session_state.get(
+                    "pdf_summary_prompt",
+                    "You are a senior regulatory and technical writer. "
+                    "Create a comprehensive, well-structured Markdown summary "
+                    "of the combined PDF content, including:\n"
+                    "- Overall purpose and scope\n"
+                    "- Key sections and main findings\n"
+                    "- Critical risks, mitigations, and test results\n"
+                    "- Any obvious gaps or open questions\n"
+                    "Use headings, bullet points, and tables when appropriate.",
+                ),
+                height=160,
+                key="pdf_summary_prompt",
+            )
+            run_summary = st.button("🧵 Generate Combined PDF Summary")
+
+        with col_sum:
+            st.markdown("**Summary (Markdown – editable)**")
+            if run_summary:
+                dummy_agent = AgentConfig(
+                    id="pdf_summary",
+                    name="PDF Summary",
+                    description="",
+                    model=model,
+                    max_tokens=int(max_tokens),
+                    temperature=float(temperature),
+                    system_prompt=summary_prompt,
+                    provider=provider,
+                )
+                try:
+                    result = run_agent(dummy_agent, combined_text)
+                    st.session_state.pdf_summary_md = result
+                except Exception as e:
+                    st.error(f"Summary generation error: {e}")
+
+            st.session_state.pdf_summary_md = st.text_area(
+                "",
+                value=st.session_state.pdf_summary_md,
+                height=260,
+                key="pdf_summary_md",
+                label_visibility="collapsed",
+            )
+
+        # --- Word graph: 20 entities in a table ---
+        st.markdown("### 🌐 Word Graph · 20 Key Entities with Context (Table)")
+        wg_col1, wg_col2 = st.columns([1, 2])
+        with wg_col1:
+            st.caption(
+                "從合併後內容中擷取 20 個關鍵實體，並以『字詞圖譜』概念呈現其連結與脈絡。"
+            )
+            wg_provider = st.selectbox(
+                "Provider for Word Graph",
+                options=list(AI_MODELS.keys()),
+                index=0,
+                key="pdf_word_graph_provider",
+            )
+            wg_model = st.selectbox(
+                "Model for Word Graph",
+                options=AI_MODELS[wg_provider],
+                key="pdf_word_graph_model",
+            )
+            wg_max_tokens = st.number_input(
+                "Max Tokens (Word Graph)",
+                min_value=256,
+                max_value=DEFAULT_MAX_TOKENS,
+                value=4096,
+                step=256,
+                key="pdf_word_graph_max_tokens",
+            )
+            run_word_graph = st.button("📊 Build 20-Entity Word Graph Table")
+        with wg_col2:
+            if run_word_graph:
+                wg_system_prompt = """
+You are analyzing the merged PDF content.
+
+Identify exactly 20 key entities (concepts, terms, stakeholders, standards, devices, risks, tests, etc.).
+Think of this as a 'word graph':
+
+For each entity, provide:
+- Entity (the main term or concept)
+- Type (e.g., Device, Risk, Standard, Stakeholder, Test, Material, Requirement, etc.)
+- Direct Connections (comma-separated list of 2–6 closely related entities)
+- Local Context (1–2 sentences describing how this entity appears in the document)
+- Importance (1–5, where 5 = critical to understanding the document)
+
+Return ONLY a Markdown table with columns:
+
+| # | Entity | Type | Direct Connections | Local Context | Importance |
+
+Exactly 20 rows, numbered 1–20.
+"""
+                dummy_agent = AgentConfig(
+                    id="pdf_word_graph",
+                    name="PDF Word Graph",
+                    description="",
+                    model=wg_model,
+                    max_tokens=int(wg_max_tokens),
+                    temperature=0.1,
+                    system_prompt=wg_system_prompt,
+                    provider=wg_provider,
+                )
+                try:
+                    result = run_agent(dummy_agent, combined_text)
+                    st.session_state.pdf_word_graph_md = result
+                except Exception as e:
+                    st.error(f"Word graph generation error: {e}")
+
+            if st.session_state.pdf_word_graph_md:
+                st.markdown(st.session_state.pdf_word_graph_md)
+
+        st.markdown("---")
+
+        # --- Prompt on combined file, compare two configs side-by-side ---
+        st.markdown("### 🔍 Ask Questions on Combined PDF · Side-by-Side Comparison")
+
+        col_left, col_right = st.columns(2)
+
+        with col_left:
+            st.markdown("#### Config A")
+            prompt_a = st.text_area(
+                "Prompt A",
+                value=st.session_state.get(
+                    "pdf_prompt_a",
+                    "Summarize the combined file for a regulatory reviewer and list 5 key questions "
+                    "they should ask before clearance.",
+                ),
+                height=150,
+                key="pdf_prompt_a",
+            )
+            provider_a = st.selectbox(
+                "Provider A",
+                options=list(AI_MODELS.keys()),
+                index=0,
+                key="pdf_provider_a",
+            )
+            model_a = st.selectbox(
+                "Model A",
+                options=AI_MODELS[provider_a],
+                key="pdf_model_a",
+            )
+            temp_a = st.slider(
+                "Temperature A",
+                0.0,
+                1.0,
+                value=0.3,
+                key="pdf_temp_a",
+            )
+            max_tokens_a = st.number_input(
+                "Max Tokens A",
+                min_value=256,
+                max_value=DEFAULT_MAX_TOKENS,
+                value=DEFAULT_MAX_TOKENS,
+                step=256,
+                key="pdf_max_tokens_a",
+            )
+
+        with col_right:
+            st.markdown("#### Config B")
+            prompt_b = st.text_area(
+                "Prompt B",
+                value=st.session_state.get(
+                    "pdf_prompt_b",
+                    "Create a concise executive briefing of the combined file, focusing on "
+                    "clinical performance, safety risks, and major mitigations.",
+                ),
+                height=150,
+                key="pdf_prompt_b",
+            )
+            provider_b = st.selectbox(
+                "Provider B",
+                options=list(AI_MODELS.keys()),
+                index=1 if len(AI_MODELS) > 1 else 0,
+                key="pdf_provider_b",
+            )
+            model_b = st.selectbox(
+                "Model B",
+                options=AI_MODELS[provider_b],
+                key="pdf_model_b",
+            )
+            temp_b = st.slider(
+                "Temperature B",
+                0.0,
+                1.0,
+                value=0.3,
+                key="pdf_temp_b",
+            )
+            max_tokens_b = st.number_input(
+                "Max Tokens B",
+                min_value=256,
+                max_value=DEFAULT_MAX_TOKENS,
+                value=DEFAULT_MAX_TOKENS,
+                step=256,
+                key="pdf_max_tokens_b",
+            )
+
+        run_compare = st.button("⚖️ Run Comparison on Combined PDF (A vs B)")
+        if run_compare:
+            with st.spinner("Running Config A…"):
+                try:
+                    agent_a = AgentConfig(
+                        id="pdf_compare_a",
+                        name="PDF Compare A",
+                        description="",
+                        model=model_a,
+                        max_tokens=int(max_tokens_a),
+                        temperature=float(temp_a),
+                        system_prompt=(
+                            "You have full access to the combined PDF text below. "
+                            "Use the user prompt at the end to drive your answer."
+                        ),
+                        provider=provider_a,
+                    )
+                    input_a = (
+                        "COMBINED PDF CONTENT:\n\n"
+                        + combined_text
+                        + "\n\n---\n\nUSER PROMPT:\n"
+                        + prompt_a
+                    )
+                    st.session_state.pdf_compare_result_a = run_agent(agent_a, input_a)
+                except Exception as e:
+                    st.error(f"Config A error: {e}")
+
+            with st.spinner("Running Config B…"):
+                try:
+                    agent_b = AgentConfig(
+                        id="pdf_compare_b",
+                        name="PDF Compare B",
+                        description="",
+                        model=model_b,
+                        max_tokens=int(max_tokens_b),
+                        temperature=float(temp_b),
+                        system_prompt=(
+                            "You have full access to the combined PDF text below. "
+                            "Use the user prompt at the end to drive your answer."
+                        ),
+                        provider=provider_b,
+                    )
+                    input_b = (
+                        "COMBINED PDF CONTENT:\n\n"
+                        + combined_text
+                        + "\n\n---\n\nUSER PROMPT:\n"
+                        + prompt_b
+                    )
+                    st.session_state.pdf_compare_result_b = run_agent(agent_b, input_b)
+                except Exception as e:
+                    st.error(f"Config B error: {e}")
+
+        # Side-by-side outputs with text/Markdown toggle and editing
+        st.markdown("#### Comparison Results (Editable)")
+
+        out_col_left, out_col_right = st.columns(2)
+
+        with out_col_left:
+            st.markdown("**Result A**")
+            view_a = st.radio(
+                "View mode A",
+                options=["Edit (Text)", "Preview (Markdown)"],
+                index=0 if st.session_state.pdf_compare_view_a == "Edit (Text)" else 1,
+                key="pdf_compare_view_a_radio",
+            )
+            st.session_state.pdf_compare_view_a = view_a
+            if view_a == "Edit (Text)":
+                st.session_state.pdf_compare_result_a = st.text_area(
+                    "",
+                    value=st.session_state.pdf_compare_result_a,
+                    height=260,
+                    key="pdf_compare_result_a_text",
+                    label_visibility="collapsed",
+                )
+            else:
+                st.markdown(st.session_state.pdf_compare_result_a or "_No result yet._")
+
+        with out_col_right:
+            st.markdown("**Result B**")
+            view_b = st.radio(
+                "View mode B",
+                options=["Edit (Text)", "Preview (Markdown)"],
+                index=0 if st.session_state.pdf_compare_view_b == "Edit (Text)" else 1,
+                key="pdf_compare_view_b_radio",
+            )
+            st.session_state.pdf_compare_view_b = view_b
+            if view_b == "Edit (Text)":
+                st.session_state.pdf_compare_result_b = st.text_area(
+                    "",
+                    value=st.session_state.pdf_compare_result_b,
+                    height=260,
+                    key="pdf_compare_result_b_text",
+                    label_visibility="collapsed",
+                )
+            else:
+                st.markdown(st.session_state.pdf_compare_result_b or "_No result yet._")
+
+        # --- Transform results into colored note ---
+        st.markdown("### 🎨 Transform Result into Colored Markdown Notes")
+
+        cn_col1, cn_col2 = st.columns([1.1, 1.9])
+        with cn_col1:
+            target = st.selectbox(
+                "Select source result",
+                options=[
+                    "Left (Config A result)",
+                    "Right (Config B result)",
+                    "Combined Summary",
+                ],
+                key="pdf_colored_note_source",
+            )
+            keywords = st.text_input(
+                "Keywords to highlight (comma-separated)",
+                key="pdf_colored_note_keywords",
+                placeholder="e.g., risk, mitigation, predicate device",
+            )
+            color = st.color_picker("Highlight color", "#FFD54F", key="pdf_colored_note_color")
+            run_colored = st.button("🖍 Transform into Colored Notes")
+
+        with cn_col2:
+            if run_colored:
+                if target.startswith("Left"):
+                    base_text = st.session_state.pdf_compare_result_a
+                elif target.startswith("Right"):
+                    base_text = st.session_state.pdf_compare_result_b
+                else:
+                    base_text = st.session_state.pdf_summary_md
+
+                colored = highlight_keywords_colored(base_text or "", keywords, color)
+                st.session_state.pdf_colored_note = colored
+
+            if st.session_state.pdf_colored_note:
+                st.markdown("**Colored Note (Markdown + highlights)**")
+                st.markdown(st.session_state.pdf_colored_note, unsafe_allow_html=True)
+
+
+# =========================
+# 10. DASHBOARD TAB
 # =========================
 
 def dashboard_tab():
@@ -1316,7 +1807,7 @@ def dashboard_tab():
 
 
 # =========================
-# 10. SETTINGS / LANGUAGE / THEME
+# 11. SETTINGS SIDEBAR
 # =========================
 
 def settings_sidebar():
@@ -1364,7 +1855,7 @@ def settings_sidebar():
 
 
 # =========================
-# 11. MAIN APP
+# 12. MAIN APP
 # =========================
 
 def main():
@@ -1382,6 +1873,7 @@ def main():
     tabs = st.tabs(
         [
             "🔗 Review Pipeline",
+            "📎 PDF Studio",
             "🧾 AI Note Keeper",
             "📊 Dashboard",
         ]
@@ -1389,8 +1881,10 @@ def main():
     with tabs[0]:
         pipeline_tab()
     with tabs[1]:
-        note_keeper_tab()
+        pdf_studio_tab()
     with tabs[2]:
+        note_keeper_tab()
+    with tabs[3]:
         dashboard_tab()
 
 
