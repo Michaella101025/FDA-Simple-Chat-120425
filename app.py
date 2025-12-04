@@ -14,6 +14,12 @@ import pandas as pd
 # PDF tools
 from PyPDF2 import PdfReader, PdfWriter
 
+# OCR & imaging
+import numpy as np
+import easyocr
+from pdf2image import convert_from_bytes
+from PIL import Image
+
 # --- AI SDKs ---
 import google.generativeai as genai
 from openai import OpenAI
@@ -344,6 +350,12 @@ def init_session_state():
     st.session_state.setdefault("pdf_compare_view_a", "Preview (Markdown)")
     st.session_state.setdefault("pdf_compare_view_b", "Preview (Markdown)")
     st.session_state.setdefault("pdf_colored_note", "")
+
+    # OCR workspace state
+    st.session_state.setdefault("ocr_source_bytes", None)
+    st.session_state.setdefault("ocr_source_ext", "")
+    st.session_state.setdefault("ocr_raw_text", "")
+    st.session_state.setdefault("ocr_llm_text", "")
 
 
 # =========================
@@ -1245,7 +1257,7 @@ Use Markdown:
 
 
 # =========================
-# 9. PDF STUDIO (NEW FEATURE)
+# 9. PDF STUDIO
 # =========================
 
 def pdf_to_base64(pdf_bytes: bytes) -> str:
@@ -1744,6 +1756,231 @@ Exactly 20 rows, numbered 1–20.
                 st.markdown("**Colored Note (Markdown + highlights)**")
                 st.markdown(st.session_state.pdf_colored_note, unsafe_allow_html=True)
 
+
+# =========================
+# 10. OCR STUDIO (NEW)
+# =========================
+
+@st.cache_resource
+def get_easyocr_reader(lang_tuple: tuple):
+    """
+    Cache EasyOCR readers to avoid re-loading models each time.
+    lang_tuple: e.g. ('en',) or ('ch_tra',) or ('en', 'ch_tra')
+    """
+    return easyocr.Reader(list(lang_tuple), gpu=False)
+
+
+def perform_python_ocr(file_bytes: bytes, ext: str, lang_mode: str) -> str:
+    """
+    Python-based OCR using EasyOCR, supporting:
+    - Image files (PNG/JPG/TIFF/BMP)
+    - PDF (via pdf2image)
+    Languages: English / Traditional Chinese / Mixed
+    """
+    if not file_bytes:
+        return ""
+
+    ext = (ext or "").lower()
+    if lang_mode == "English":
+        langs = ("en",)
+    elif lang_mode == "繁體中文":
+        langs = ("ch_tra",)
+    else:
+        langs = ("en", "ch_tra")
+
+    reader = get_easyocr_reader(langs)
+
+    texts: List[str] = []
+
+    try:
+        if ext == ".pdf":
+            pages = convert_from_bytes(file_bytes, dpi=300)
+            for i, page in enumerate(pages):
+                arr = np.array(page.convert("RGB"))
+                res = reader.readtext(arr, detail=0, paragraph=True)
+                if res:
+                    texts.append(f"--- Page {i+1} ---")
+                    texts.append("\n".join(res))
+        else:
+            image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+            arr = np.array(image)
+            res = reader.readtext(arr, detail=0, paragraph=True)
+            texts.extend(res)
+    except Exception as e:
+        return f"⚠️ Python OCR 發生錯誤：{e}"
+
+    return "\n".join(texts).strip()
+
+
+def ocr_llm_system_prompt_default() -> str:
+    return (
+        "你是一位專業的醫療器材與法規 OCR 後處理助手。\n"
+        "你會接收到由傳統 OCR 得到的『雜訊文字』，其中可能包含：\n"
+        "- 英文與繁體中文混雜\n"
+        "- 行斷錯誤、重複、錯別字\n"
+        "- 表格與段落被打散\n\n"
+        "你的任務：\n"
+        "1. 儘量還原原始文件的邏輯結構（段落、標題、條列、表格）。\n"
+        "2. 修正常見 OCR 錯誤（例如：0/O、1/l、中文斷字）。\n"
+        "3. 保留原本的語言風格；若是繁體中文內容，請維持繁體；若為英文則維持英文。\n"
+        "4. 如果有明顯缺字，可依上下文合理補足，但請避免臆測超出上下文的內容。\n\n"
+        "輸出格式：\n"
+        "- 以 Markdown 呈現（標題、清單、表格皆可使用）。\n"
+        "- 不要加入你自己的評論，只專注在文字重建。"
+    )
+
+
+def ocr_studio_tab():
+    st.subheader("🧾 OCR Studio · English / 繁體中文")
+
+    col_left, col_right = st.columns([1.05, 0.95])
+
+    with col_left:
+        st.markdown("#### 1. Source File")
+        ocr_file = st.file_uploader(
+            "Upload scanned PDF or image",
+            type=["pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp"],
+            key="ocr_file_uploader",
+        )
+        if ocr_file is not None:
+            st.session_state.ocr_source_bytes = ocr_file.getvalue()
+            _, ext = os.path.splitext(ocr_file.name)
+            st.session_state.ocr_source_ext = ext.lower()
+
+        lang_mode = st.radio(
+            "Language 模式",
+            options=["English", "繁體中文", "Mixed / 混合"],
+            index=2,
+            key="ocr_lang_mode",
+        )
+
+        engine_mode = st.radio(
+            "OCR 引擎",
+            options=[
+                "Python OCR only (EasyOCR)",
+                "LLM-enhanced OCR (EasyOCR + LLM cleanup)",
+            ],
+            index=1,
+            key="ocr_engine_mode",
+        )
+
+        st.markdown("---")
+
+        if engine_mode == "LLM-enhanced OCR (EasyOCR + LLM cleanup)":
+            st.markdown("#### 2. LLM 設定（用於清理與重建 OCR 文字）")
+            provider = st.selectbox(
+                "Provider",
+                options=list(AI_MODELS.keys()),
+                index=0,
+                key="ocr_llm_provider",
+            )
+            model = st.selectbox(
+                "Model",
+                options=AI_MODELS[provider],
+                key="ocr_llm_model",
+            )
+            temperature = st.slider(
+                "Temperature",
+                0.0,
+                1.0,
+                value=0.2,
+                key="ocr_llm_temp",
+            )
+            max_tokens = st.number_input(
+                "Max Tokens",
+                min_value=512,
+                max_value=DEFAULT_MAX_TOKENS,
+                value=DEFAULT_MAX_TOKENS,
+                step=256,
+                key="ocr_llm_max_tokens",
+            )
+            system_prompt = st.text_area(
+                "LLM OCR System Prompt（可自行微調）",
+                value=st.session_state.get("ocr_llm_system_prompt", ocr_llm_system_prompt_default()),
+                height=200,
+                key="ocr_llm_system_prompt",
+            )
+        else:
+            provider = model = None
+            temperature = 0.0
+            max_tokens = DEFAULT_MAX_TOKENS
+            system_prompt = ""
+
+        run_ocr = st.button("🔍 Run OCR")
+
+    with col_right:
+        st.markdown("#### 3. OCR Result")
+
+        if run_ocr:
+            if not st.session_state.ocr_source_bytes:
+                st.error("請先上傳要進行 OCR 的檔案。")
+            else:
+                with st.spinner("Running Python OCR (EasyOCR)…"):
+                    raw_text = perform_python_ocr(
+                        st.session_state.ocr_source_bytes,
+                        st.session_state.ocr_source_ext,
+                        lang_mode,
+                    )
+                    st.session_state.ocr_raw_text = raw_text or ""
+
+                if engine_mode == "LLM-enhanced OCR (EasyOCR + LLM cleanup)" and raw_text.strip():
+                    dummy_agent = AgentConfig(
+                        id="ocr_llm",
+                        name="OCR LLM Cleanup",
+                        description="",
+                        model=model,
+                        max_tokens=int(max_tokens),
+                        temperature=float(temperature),
+                        system_prompt=system_prompt,
+                        provider=provider,
+                    )
+                    try:
+                        with st.spinner("Calling LLM to clean & restructure OCR text…"):
+                            llm_out = run_agent(dummy_agent, raw_text)
+                            st.session_state.ocr_llm_text = llm_out or ""
+                    except Exception as e:
+                        st.error(f"LLM OCR error: {e}")
+                        st.session_state.ocr_llm_text = ""
+
+        if st.session_state.ocr_raw_text:
+            st.markdown("**Raw OCR Text (EasyOCR)**")
+            st.session_state.ocr_raw_text = st.text_area(
+                "",
+                value=st.session_state.ocr_raw_text,
+                height=220,
+                key="ocr_raw_text_area",
+                label_visibility="collapsed",
+            )
+            if st.button("📥 Use Raw OCR as Pipeline Global Input"):
+                st.session_state["pipeline_global_input"] = st.session_state.ocr_raw_text
+                st.success("已將 Raw OCR 文字送入 Review Pipeline 的 Global Input。")
+
+        if st.session_state.ocr_llm_text:
+            st.markdown("**LLM‑Refined OCR Text (Markdown – editable)**")
+            st.session_state.ocr_llm_text = st.text_area(
+                "",
+                value=st.session_state.ocr_llm_text,
+                height=260,
+                key="ocr_llm_text_area",
+                label_visibility="collapsed",
+            )
+            if st.button("📥 Use LLM‑Refined OCR as Pipeline Global Input"):
+                st.session_state["pipeline_global_input"] = st.session_state.ocr_llm_text
+                st.success("已將 LLM 整理後的 OCR 文字送入 Review Pipeline 的 Global Input。")
+
+
+# =========================
+# 11. DASHBOARD TAB
+# =========================
+
+def dashboard_tab():
+    st.subheader("📊 Interactive Analytics Dashboard")
+
+    m = st.session_state.metrics
+    top_cols = st.columns(4)
+    top_cols[0].metric("Total Agent Runs", m["total_runs"])
+    top_cols[1].metric("Tokens (approx.) Used", m["tokens_used"])
+    top_cols[2].metric("Last Run Duration (s)", round(m["last_run_duration
 
 # =========================
 # 10. DASHBOARD TAB
